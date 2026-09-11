@@ -255,6 +255,18 @@ def app(environ, start_response):
             status, headers, body = handle_media(track_id, as_download=True)
         elif route == "thumb":
             status, headers, body = handle_thumb(track_id)
+        elif route == "debug":
+            info = {
+                "bot_token_set": bool(BOT_TOKEN),
+                "bot_token_len": len(BOT_TOKEN),
+                "webhook_secret_set": bool(WEBHOOK_SECRET),
+                "webhook_secret_len": len(WEBHOOK_SECRET),
+                "web_app_url": WEB_APP_URL,
+                "upstash_url_set": bool(UPSTASH_URL),
+                "upstash_token_set": bool(UPSTASH_TOKEN),
+                "received_secret_header_len": len(environ.get("HTTP_X_TELEGRAM_BOT_API_SECRET_TOKEN", "")),
+            }
+            status, headers, body = 200, JSON_HEADERS, json.dumps(info).encode()
         elif not route and method == "GET":
             status = 200
             headers = [("Content-Type", "text/html; charset=utf-8")]
