@@ -32,8 +32,13 @@ HTML_PAGE = '<!DOCTYPE html>\n<html lang="en" dir="ltr">\n<head>\n<meta charset=
 
 # ---------------------------------------------------------------- helpers --
 
+LAST_REDIS_ERROR = None
+
+
 def redis_cmd(*args):
+    global LAST_REDIS_ERROR
     if not UPSTASH_URL or not UPSTASH_TOKEN:
+        LAST_REDIS_ERROR = "missing UPSTASH_URL or UPSTASH_TOKEN"
         return None
     data = json.dumps(list(args)).encode("utf-8")
     req = urllib.request.Request(UPSTASH_URL, data=data, method="POST")
@@ -44,11 +49,17 @@ def redis_cmd(*args):
             body = resp.read()
     except urllib.error.HTTPError as e:
         body = e.read()
-    except Exception:
+        LAST_REDIS_ERROR = f"HTTPError {e.code}: {body[:200]}"
+    except Exception as e:
+        LAST_REDIS_ERROR = f"Exception: {e}"
         return None
     try:
-        return json.loads(body).get("result")
-    except Exception:
+        parsed = json.loads(body)
+        if "error" in parsed:
+            LAST_REDIS_ERROR = f"Upstash error: {parsed['error']}"
+        return parsed.get("result")
+    except Exception as e:
+        LAST_REDIS_ERROR = f"JSON parse error: {e}"
         return None
 
 
@@ -256,6 +267,8 @@ def app(environ, start_response):
         elif route == "thumb":
             status, headers, body = handle_thumb(track_id)
         elif route == "debug":
+            redis_ping_result = redis_cmd("PING")
+            track_count = redis_cmd("SCARD", "track_ids")
             info = {
                 "bot_token_set": bool(BOT_TOKEN),
                 "bot_token_len": len(BOT_TOKEN),
@@ -263,7 +276,13 @@ def app(environ, start_response):
                 "webhook_secret_len": len(WEBHOOK_SECRET),
                 "web_app_url": WEB_APP_URL,
                 "upstash_url_set": bool(UPSTASH_URL),
+                "upstash_url_preview": (UPSTASH_URL[:25] + "...") if UPSTASH_URL else "",
                 "upstash_token_set": bool(UPSTASH_TOKEN),
+                "upstash_token_len": len(UPSTASH_TOKEN),
+                "redis_ping_result": redis_ping_result,
+                "redis_reachable": redis_ping_result == "PONG",
+                "track_count_in_redis": track_count,
+                "last_redis_error": LAST_REDIS_ERROR,
                 "received_secret_header_len": len(environ.get("HTTP_X_TELEGRAM_BOT_API_SECRET_TOKEN", "")),
             }
             status, headers, body = 200, JSON_HEADERS, json.dumps(info).encode()
