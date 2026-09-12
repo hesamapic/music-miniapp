@@ -23,6 +23,8 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 WEB_APP_URL = os.environ.get("WEB_APP_URL", "")
 UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "")
 UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
+RELAY_CHANNEL = os.environ.get("RELAY_CHANNEL", "")  # e.g. @my_music_relay
+PUBLIC_CHANNEL = os.environ.get("PUBLIC_CHANNEL", "")  # e.g. @hesamwithmusic
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 JSON_HEADERS = [("Content-Type", "application/json")]
@@ -84,13 +86,32 @@ def get_telegram_file_path(file_id):
     return data["result"]["file_path"]
 
 
-def fetch_telegram_file_bytes(file_id):
+def fetch_telegram_file_bytes(file_id, range_header=None):
+    """
+    فایل رو از تلگرام می‌گیره. اگه range_header داده بشه (مثلاً "bytes=1000000-"),
+    همون رنج رو از سرور فایل تلگرام درخواست می‌کنه (اکثر پلیرهای صوتی، به‌خصوص
+    سافاری/آیفون، برای پخش پیوسته و seek کردن از Range Request استفاده می‌کنن؛
+    بدون پشتیبانی ازش، پخش وسط راه قطع می‌شه).
+
+    خروجی: (data_bytes, status_code, content_range_header)
+    """
     file_path = get_telegram_file_path(file_id)
     if not file_path:
-        return None
+        return None, None, None
     file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-    with urllib.request.urlopen(file_url, timeout=25) as resp:
-        return resp.read()
+    req = urllib.request.Request(file_url)
+    if range_header:
+        req.add_header("Range", range_header)
+    try:
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            data = resp.read()
+            status = resp.status
+            content_range = resp.headers.get("Content-Range")
+    except urllib.error.HTTPError as e:
+        if e.code == 416:
+            return None, 416, None
+        raise
+    return data, status, content_range
 
 
 def send_message(chat_id, text, web_app_url=None):
@@ -138,6 +159,47 @@ def index_audio_message(msg):
     redis_cmd("SADD", "track_ids", file_unique_id)
 
 
+def is_relay_channel(chat):
+    if not RELAY_CHANNEL:
+        return False
+    target = RELAY_CHANNEL.lstrip("@").lower()
+    chat_username = (chat.get("username") or "").lower()
+    chat_id = str(chat.get("id", ""))
+    return chat_username == target or chat_id == RELAY_CHANNEL
+
+
+def repost_to_public_channel(msg):
+    if not PUBLIC_CHANNEL:
+        return
+    audio = msg.get("audio")
+    if not audio:
+        return
+
+    title = audio.get("title") or "بدون‌نام"
+    performer = audio.get("performer") or "ناشناس"
+    user_caption = (msg.get("caption") or "").strip()
+
+    lines = [f"🎵 {title} — {performer}"]
+    if user_caption:
+        lines.append(user_caption)
+    lines.append(f"📢 {PUBLIC_CHANNEL}")
+    caption = "\n".join(lines)
+
+    payload = {
+        "chat_id": PUBLIC_CHANNEL,
+        "from_chat_id": msg["chat"]["id"],
+        "message_id": msg["message_id"],
+        "caption": caption,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(f"{TELEGRAM_API}/copyMessage", data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    try:
+        urllib.request.urlopen(req, timeout=10)
+    except Exception:
+        pass
+
+
 # ----------------------------------------------------------- route logic --
 
 def handle_webhook(environ):
@@ -168,6 +230,8 @@ def handle_webhook(environ):
 
     if channel_post:
         index_audio_message(channel_post)
+        if is_relay_channel(channel_post.get("chat", {})):
+            repost_to_public_channel(channel_post)
 
     return 200, JSON_HEADERS, b'{"ok":true}'
 
@@ -193,7 +257,7 @@ def handle_random():
     return 200, headers, json.dumps(result).encode()
 
 
-def handle_media(track_id, as_download):
+def handle_media(track_id, as_download, range_header=None):
     if not track_id:
         return 400, JSON_HEADERS, b'{"ok":false,"error":"missing id"}'
 
@@ -201,21 +265,38 @@ def handle_media(track_id, as_download):
     if not track:
         return 404, JSON_HEADERS, b'{"ok":false,"error":"track not found"}'
 
+    # دانلود همیشه کل فایل رو می‌فرسته؛ پخش زنده از Range پشتیبانی می‌کنه
+    # تا سافاری/آیفون و بقیه‌ی پلیرها بتونن پیوسته و بدون قطع‌شدن پخش کنن.
+    effective_range = None if as_download else range_header
+
     try:
-        data = fetch_telegram_file_bytes(track["file_id"])
+        data, upstream_status, content_range = fetch_telegram_file_bytes(
+            track["file_id"], range_header=effective_range
+        )
     except Exception:
-        data = None
+        data, upstream_status, content_range = None, None, None
 
     if data is None:
         return 502, JSON_HEADERS, b'{"ok":false,"error":"could not fetch file from telegram"}'
 
     mime_type = track.get("mime_type", "audio/mpeg")
-    headers = [("Content-Type", mime_type), ("Cache-Control", "public, max-age=3600")]
+    headers = [
+        ("Content-Type", mime_type),
+        ("Accept-Ranges", "bytes"),
+        ("Cache-Control", "public, max-age=3600"),
+        ("Content-Length", str(len(data))),
+    ]
+
+    status = 200
+    if effective_range and upstream_status == 206 and content_range:
+        status = 206
+        headers.append(("Content-Range", content_range))
+
     if as_download:
         safe_name = f"{track.get('performer','track')} - {track.get('title','audio')}.mp3"
         headers.append(("Content-Disposition", f'attachment; filename="{safe_name}"'))
 
-    return 200, headers, data
+    return status, headers, data
 
 
 def handle_thumb(track_id):
@@ -228,7 +309,7 @@ def handle_thumb(track_id):
         return 404, JSON_HEADERS, b'{"ok":false,"error":"no thumbnail"}'
 
     try:
-        data = fetch_telegram_file_bytes(thumb_file_id)
+        data, _status, _content_range = fetch_telegram_file_bytes(thumb_file_id)
     except Exception:
         data = None
 
@@ -261,7 +342,8 @@ def app(environ, start_response):
         elif route == "random":
             status, headers, body = handle_random()
         elif route == "stream":
-            status, headers, body = handle_media(track_id, as_download=False)
+            range_header = environ.get("HTTP_RANGE")
+            status, headers, body = handle_media(track_id, as_download=False, range_header=range_header)
         elif route == "download":
             status, headers, body = handle_media(track_id, as_download=True)
         elif route == "thumb":
@@ -283,6 +365,8 @@ def app(environ, start_response):
                 "redis_reachable": redis_ping_result == "PONG",
                 "track_count_in_redis": track_count,
                 "last_redis_error": LAST_REDIS_ERROR,
+                "relay_channel_set": bool(RELAY_CHANNEL),
+                "public_channel_set": bool(PUBLIC_CHANNEL),
                 "received_secret_header_len": len(environ.get("HTTP_X_TELEGRAM_BOT_API_SECRET_TOKEN", "")),
             }
             status, headers, body = 200, JSON_HEADERS, json.dumps(info).encode()
@@ -296,8 +380,9 @@ def app(environ, start_response):
         status, headers, body = 500, JSON_HEADERS, json.dumps({"ok": False, "error": str(e)}).encode()
 
     status_text = {
-        200: "200 OK", 400: "400 Bad Request", 401: "401 Unauthorized",
-        404: "404 Not Found", 502: "502 Bad Gateway", 500: "500 Internal Server Error",
+        200: "200 OK", 206: "206 Partial Content", 400: "400 Bad Request", 401: "401 Unauthorized",
+        404: "404 Not Found", 416: "416 Range Not Satisfiable",
+        502: "502 Bad Gateway", 500: "500 Internal Server Error",
     }.get(status, f"{status} OK")
 
     headers = list(headers) + [("Access-Control-Allow-Origin", "*")]
